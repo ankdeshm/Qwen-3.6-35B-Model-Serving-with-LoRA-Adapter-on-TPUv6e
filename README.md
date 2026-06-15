@@ -17,16 +17,13 @@ Deploying this highly optimized, long-context workload requires a structured seq
 
 ## 📋 Step-by-Step Setup Guide
 
-### Phase 1: Infrastructure & Networking Setup
-Before deploying the serving components, the fundamental GKE and VPC environment must be built out.
+### Phase 1: Infrastructure & Environment Provisioning
+Before deploying any serving workloads, the foundational environment must be provisioned.
 
-1.  **Configure Custom Networking**
-    High-throughput TPU multi-host communication requires dedicated network setups to prevent inter-node bottlenecks. Set up the network stack by following:
-    `create_custom_networking.md`
-2.  **Spin Up Infrastructure & GKE Cluster**
-    Deploy the core GKE cluster pinned to your custom VPC/subnetwork, retrieve credentials, inject your Hugging Face secret, and install the LeaderWorkerSet (LWS) operator via Helm. This file also provisions GCS Rapid Cache in the TPU zone and configures secure Google Cloud Workload Identity bindings for storage access control. Follow the setup via:
+1.  **Spin Up Infrastructure & GKE Cluster**
+    Establish the entire cluster footprint, starting from a dedicated custom VPC/subnetwork optimized for TPU communication, to spinning up the GKE cluster linked directly to that network. This document also handles retrieving credentials, injecting your Hugging Face secret token, installing the LeaderWorkerSet (LWS) operator via Helm, provisioning GCS Rapid Cache in the target zone, and establishing secure Google Cloud Workload Identity bindings for cloud storage permissions. Follow the setup via:
     `setup_infra.md`
-3.  **Provision TPU Node Pools**
+2.  **Provision TPU Node Pools**
     Depending on whether you are targeting the single-host (`v6e-8`) or multi-host (`v6e-16`) deployment architecture, create the specialized TPU node pools by executing the configurations within:
     `provision_tpu.md`
 
