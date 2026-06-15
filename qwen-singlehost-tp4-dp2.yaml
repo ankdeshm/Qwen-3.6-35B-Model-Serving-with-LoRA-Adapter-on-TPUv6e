@@ -1,0 +1,262 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen-lora-bench-8t
+  namespace: default
+spec:
+  template:
+    spec:
+      shareProcessNamespace: true
+      nodeSelector:
+        cloud.google.com/gke-nodepool: ank-tpu-v6e8-pool
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 2x4
+        cloud.google.com/gke-flex-start: "true"
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Equal"
+        value: "present"
+        effect: "NoSchedule"
+      initContainers:
+      - name: download-merged-model
+        image: google/cloud-sdk:slim
+        command:
+        - "bash"
+        - "-c"
+        - |
+          set -ex
+          echo "Downloading merged model from GCS bucket..."
+          mkdir -p /osmosis/merged_model
+          gcloud storage cp -r gs://ank-qwen-serving-314837540096/qwen36-35b-merged/* /osmosis/merged_model/
+          echo "Download complete."
+          
+          echo "Creating local load balancer proxy script..."
+          cat << 'EOF' > /osmosis/proxy.py
+          import http.server
+          import socketserver
+          import urllib.request
+          import urllib.error
+          import threading
+          import sys
+
+          TARGET_PORTS = [8001, 8002]
+          current_index = 0
+          lock = threading.Lock()
+
+          class ProxyHandler(http.server.BaseHTTPRequestHandler):
+              def log_message(self, format, *args):
+                  pass
+
+              def do_GET(self):
+                  self.proxy_request("GET")
+
+              def do_POST(self):
+                  self.proxy_request("POST")
+
+              def proxy_request(self, method):
+                  global current_index
+                  with lock:
+                      port = TARGET_PORTS[current_index]
+                      current_index = (current_index + 1) % len(TARGET_PORTS)
+
+                  url = f"http://127.0.0.1:{port}{self.path}"
+                  
+                  content_length = int(self.headers.get('Content-Length', 0))
+                  body = self.rfile.read(content_length) if content_length > 0 else None
+
+                  headers = {key: val for key, val in self.headers.items() if key.lower() not in ['host', 'connection', 'content-length']}
+                  
+                  req = urllib.request.Request(url, data=body, headers=headers, method=method)
+                  try:
+                      with urllib.request.urlopen(req, timeout=120) as response:
+                          self.send_response(response.status)
+                          for key, val in response.getheaders():
+                              if key.lower() not in ['transfer-encoding', 'connection']:
+                                  self.send_header(key, val)
+                          self.end_headers()
+                          while True:
+                              chunk = response.read(1024)
+                              if not chunk:
+                                  break
+                              self.wfile.write(chunk)
+                              self.wfile.flush()
+                  except urllib.error.HTTPError as e:
+                      self.send_response(e.code)
+                      for key, val in e.headers.items():
+                          if key.lower() not in ['transfer-encoding', 'connection']:
+                              self.send_header(key, val)
+                      self.end_headers()
+                      self.wfile.write(e.read())
+                  except urllib.error.URLError as e:
+                      self.send_response(503)
+                      self.end_headers()
+                      self.wfile.write(b"Service Unavailable")
+                  except Exception as e:
+                      self.send_response(500)
+                      self.end_headers()
+                      self.wfile.write(str(e).encode())
+
+          def run_proxy(port=8000):
+              handler = ProxyHandler
+              socketserver.TCPServer.allow_reuse_address = True
+              with socketserver.ThreadingTCPServer(("", port), handler) as httpd:
+                  print(f"Proxy serving on port {port} forwarding to {TARGET_PORTS}...", flush=True)
+                  httpd.serve_forever()
+
+          if __name__ == "__main__":
+              run_proxy()
+          EOF
+        volumeMounts:
+        - name: osmosis-volume
+          mountPath: /osmosis
+      containers:
+      - name: vllm-server
+        image: vllm/vllm-tpu:nightly-20260612-c0c56aa-8a91228
+        command: ["bash", "-c"]
+        args:
+        - |
+          set -ex
+          python3 /osmosis/proxy.py &
+          
+          echo "Starting Server 0 on port 8001 (chips 0-3)..."
+          TPU_VISIBLE_CHIPS="0,1,2,3" vllm serve /osmosis/merged_model \
+            --tensor-parallel-size 4 \
+            --data-parallel-size 1 \
+            --port 8001 \
+            --max-model-len 8192 \
+            --max-num-batched-tokens 16384 \
+            --max-num-seqs 64 \
+            --gpu-memory-utilization 0.60 \
+            --enable-prefix-caching \
+            --trust-remote-code > /osmosis/server0.log 2>&1 &
+            
+          echo "Starting Server 1 on port 8002 (chips 4-7)..."
+          TPU_VISIBLE_CHIPS="4,5,6,7" vllm serve /osmosis/merged_model \
+            --tensor-parallel-size 4 \
+            --data-parallel-size 1 \
+            --port 8002 \
+            --max-model-len 131072 \
+            --max-num-batched-tokens 8192 \
+            --max-num-seqs 64 \
+            --gpu-memory-utilization 0.60 \
+            --enable-prefix-caching \
+            --trust-remote-code > /osmosis/server1.log 2>&1 &
+            
+          sleep 5
+          tail -f /osmosis/server0.log /osmosis/server1.log
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: HF_HOME
+          value: /hf-cache
+        - name: VLLM_ENGINE_READY_TIMEOUT_S
+          value: "1200"
+        resources:
+          requests:
+            google.com/tpu: "8"
+            memory: "550Gi"
+          limits:
+            google.com/tpu: "8"
+            memory: "550Gi"
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /hf-cache
+        - name: osmosis-volume
+          mountPath: /osmosis
+      - name: native-bench-client
+        image: vllm/vllm-tpu:nightly-20260612-c0c56aa-8a91228
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: JAX_PLATFORMS
+          value: "cpu"
+        command:
+        - "bash"
+        - "-c"
+        - |
+          set -ex
+          trap 'pkill -f vllm' EXIT
+          
+          echo "Waiting for BOTH vLLM servers to be ready..."
+          until curl -sf http://127.0.0.1:8001/health && curl -sf http://127.0.0.1:8002/health; do
+            sleep 5
+          done
+          echo "Both servers are ready. Proxy is live on port 8000."
+          
+          mkdir -p /workspace/output
+          
+          CONCURRENCIES=(8 16 32 64)
+          PROMPTS=(80 160 320 640)
+          
+          for i in "${!CONCURRENCIES[@]}"; do
+            C=${CONCURRENCIES[$i]}
+            P=${PROMPTS[$i]}
+            
+            echo "--------------------------------------------------------"
+            echo "Starting Benchmark Sweep: Concurrency=$C, Prompts=$P"
+            echo "--------------------------------------------------------"
+            
+            vllm bench serve \
+                --model /osmosis/merged_model \
+                --tokenizer /osmosis/merged_model \
+                --dataset-name random \
+                --random-input-len 6400 \
+                --random-prefix-len 2600 \
+                --random-output-len 600 \
+                --ignore-eos \
+                --max-concurrency "$C" \
+                --num-prompts "$P" \
+                --metric-percentiles 50,90,95,99 \
+                --percentile-metrics ttft,tpot,itl,e2el \
+                --save-result \
+                --result-dir /workspace/output \
+                --result-filename "production_c${C}_results.json" \
+                --base-url http://localhost:8000
+          done
+          
+          echo "Sequential sweep finished. Installing GCS tools..."
+          pip install google-cloud-storage
+          
+          echo "Uploading all TP4-DP2 results to GCS..."
+          python3 -c '
+          import os
+          from google.cloud import storage
+          
+          def upload_dir(bucket_name, local_dir, gcs_prefix):
+              client = storage.Client()
+              bucket = client.bucket(bucket_name)
+              for root, dirs, files in os.walk(local_dir):
+                  for file in files:
+                      local_path = os.path.join(root, file)
+                      rel_path = os.path.relpath(local_path, local_dir)
+                      blob_path = os.path.join(gcs_prefix, rel_path)
+                      blob = bucket.blob(blob_path)
+                      blob.upload_from_filename(local_path)
+                      print(f"Uploaded {local_path} to gs://{bucket_name}/{blob_path}")
+          
+          upload_dir("ank-qwen-serving-314837540096", "/workspace/output", "qwen3.6-35b-merged-bench/v6e/tp4-dp2_prompt_size_results")
+          '
+          echo "Sweep dataset uploaded successfully. Tearing down processes..."
+          pkill -f vllm
+          echo "Cleanup complete."
+        volumeMounts:
+        - name: output-volume
+          mountPath: /workspace/output
+        - name: osmosis-volume
+          mountPath: /osmosis
+      restartPolicy: Never
+      volumes:
+      - name: output-volume
+        emptyDir: {}
+      - name: hf-cache
+        emptyDir:
+          medium: Memory
+      - name: osmosis-volume
+        emptyDir:
+          medium: Memory
