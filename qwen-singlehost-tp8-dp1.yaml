@@ -1,0 +1,164 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qwen-lora-bench-8t
+  namespace: default
+spec:
+  template:
+    spec:
+      shareProcessNamespace: true
+      nodeSelector:
+        cloud.google.com/gke-nodepool: ank-tpu-v6e8-pool
+        cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+        cloud.google.com/gke-tpu-topology: 2x4
+        cloud.google.com/gke-flex-start: "true"
+      tolerations:
+      - key: "google.com/tpu"
+        operator: "Equal"
+        value: "present"
+        effect: "NoSchedule"
+      initContainers:
+      - name: download-merged-model
+        image: google/cloud-sdk:slim
+        command:
+        - "bash"
+        - "-c"
+        - |
+          set -ex
+          echo "Downloading merged model from YOUR GCS bucket..."
+          mkdir -p /osmosis/merged_model
+          gcloud storage cp -r gs://ank-qwen-serving-314837540096/qwen36-35b-merged/* /osmosis/merged_model/
+          echo "Download complete."
+        volumeMounts:
+        - name: osmosis-volume
+          mountPath: /osmosis
+      containers:
+      - name: vllm-server
+        image: vllm/vllm-tpu:nightly-20260612-c0c56aa-8a91228
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: HF_HOME
+          value: /hf-cache
+        - name: VLLM_ENGINE_READY_TIMEOUT_S
+          value: "1200"
+        args:
+        - "vllm"
+        - "serve"
+        - "/osmosis/merged_model"
+        - "--tensor-parallel-size"
+        - "8"
+        - "--data-parallel-size"
+        - "1"
+        - "--host"
+        - "0.0.0.0"
+        - "--port"
+        - "8000"
+        - "--max-model-len"
+        - "131072"
+        - "--max-num-batched-tokens"
+        - "16384"
+        - "--max-num-seqs"
+        - "64"
+        - "--gpu-memory-utilization"
+        - "0.80"
+        - "--enable-prefix-caching"
+        - "--trust-remote-code"
+        resources:
+          requests:
+            google.com/tpu: "8"
+            memory: "550Gi"
+          limits:
+            google.com/tpu: "8"
+            memory: "550Gi"
+        volumeMounts:
+        - name: hf-cache
+          mountPath: /hf-cache
+        - name: osmosis-volume
+          mountPath: /osmosis
+      - name: native-bench-client
+        image: vllm/vllm-tpu:nightly-20260612-c0c56aa-8a91228
+        env:
+        - name: HF_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hf-token
+              key: HF_TOKEN
+        - name: JAX_PLATFORMS
+          value: "cpu"
+        command:
+        - "bash"
+        - "-c"
+        - |
+          set -ex
+          trap 'pkill -f vllm' EXIT
+          
+          echo "Waiting for vLLM server..."
+          until curl -sf http://localhost:8000/health; do
+            sleep 5
+          done
+          echo "Server is ready."
+          
+          echo "Starting Qwen3.6-35B benchmarks..."
+          mkdir -p /workspace/output
+          
+          vllm bench serve \
+              --model /osmosis/merged_model \
+              --tokenizer /osmosis/merged_model \
+              --dataset-name random \
+              --random-input-len 6400 \
+              --random-prefix-len 2600 \
+              --random-output-len 600 \
+              --ignore-eos \
+              --max-concurrency 64 \
+              --num-prompts 640 \
+              --metric-percentiles 50,90,95,99 \
+              --percentile-metrics ttft,tpot,itl,e2el \
+              --save-result \
+              --result-dir /workspace/output \
+              --result-filename production_c64_results.json \
+              --base-url http://localhost:8000
+          
+          echo "Native benchmarks completed. Installing google-cloud-storage..."
+          pip install google-cloud-storage
+          
+          echo "Uploading results to GCS..."
+          python3 -c '
+          import os
+          from google.cloud import storage
+          
+          def upload_dir(bucket_name, local_dir, gcs_prefix):
+              client = storage.Client()
+              bucket = client.bucket(bucket_name)
+              for root, dirs, files in os.walk(local_dir):
+                  for file in files:
+                      local_path = os.path.join(root, file)
+                      rel_path = os.path.relpath(local_path, local_dir)
+                      blob_path = os.path.join(gcs_prefix, rel_path)
+                      blob = bucket.blob(blob_path)
+                      blob.upload_from_filename(local_path)
+                      print(f"Uploaded {local_path} to gs://{bucket_name}/{blob_path}")
+          
+          upload_dir("ank-qwen-serving-314837540096", "/workspace/output", "qwen3.6-35b-merged-bench/v6e/tp8-dp1_prompt_size_results")
+          '
+          echo "All results uploaded successfully. Shutting down co-located vLLM server process..."
+          pkill -f vllm
+          echo "Cleanup complete."
+        volumeMounts:
+        - name: output-volume
+          mountPath: /workspace/output
+        - name: osmosis-volume
+          mountPath: /osmosis
+      restartPolicy: Never
+      volumes:
+      - name: output-volume
+        emptyDir: {}
+      - name: hf-cache
+        emptyDir:
+          medium: Memory
+      - name: osmosis-volume
+        emptyDir:
+          medium: Memory
