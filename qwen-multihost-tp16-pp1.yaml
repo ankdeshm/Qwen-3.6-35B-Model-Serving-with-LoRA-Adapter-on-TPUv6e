@@ -1,1 +1,223 @@
-# Deploy Workload
+apiVersion: leaderworkerset.x-k8s.io/v1
+kind: LeaderWorkerSet
+metadata:
+  name: vllm-tpu-qwen-bench
+spec:
+  replicas: 1
+  leaderWorkerTemplate:
+    size: 4
+    restartPolicy: RecreateGroupOnPodRestart
+    workerTemplate:
+      metadata:
+        annotations:
+          autoscaling.gke.io/provisioning-request: "tpu-v6e-16-pr"
+          cluster-autoscaler.kubernetes.io/safe-to-evict: "false"
+        labels:
+          leaderworkerset.sigs.k8s.io/name: vllm-tpu-qwen-bench
+      spec:
+        hostname: vllm-tpu-qwen-bench
+        serviceAccountName: default
+        shareProcessNamespace: true
+        nodeSelector:
+          cloud.google.com/gke-tpu-accelerator: tpu-v6e-slice
+          cloud.google.com/gke-tpu-topology: 4x4
+          gke.networks.io/accelerator-network-profile: auto
+        tolerations:
+        - key: "google.com/tpu"
+          operator: "Exists"
+          effect: "NoSchedule"
+        - key: "cloud.google.com/gke-queued"
+          operator: "Exists"
+          effect: "NoSchedule"
+        
+        initContainers:
+        - name: download-merged-model
+          image: google/cloud-sdk:slim
+          command: ["bash", "-c"]
+          args:
+          - |
+            set -ex
+            echo "Downloading merged model from GCS into local node memory..."
+            mkdir -p /osmosis/merged_model
+            gcloud storage cp -r gs://ank-qwen-serving-314837540096/qwen36-35b-merged/* /osmosis/merged_model/
+            echo "Download complete."
+          volumeMounts:
+          - name: osmosis-volume
+            mountPath: /osmosis
+
+        containers:
+        # ---------------------------------------------------------
+        # CONTAINER 1: vLLM Multi-Host Serving (Ray Head/Worker)
+        # ---------------------------------------------------------
+        - name: vllm-tpu
+          image: vllm/vllm-tpu:nightly
+          command: ["sh", "-c"]
+          args:
+          - |
+            MY_TPU_IP=$(hostname -I | awk '{print $1}')
+            echo "My TPU Network IP is: $MY_TPU_IP"
+
+            LEADER_DNS="vllm-tpu-qwen-bench-0.vllm-tpu-qwen-bench"
+            until getent hosts $LEADER_DNS; do
+              echo "DNS not ready. Sleeping 5s..."
+              sleep 5
+            done
+            LEADER_IP=$(getent hosts $LEADER_DNS | awk '{print $1}')
+
+            export JAX_PLATFORMS=''
+            export SCAN_TPU_CHIPS=True
+            export TPU_MULTIHOST_BACKEND=ray
+            export JAX_DISTRIBUTED_INITIALIZATION_TIMEOUT=300
+            export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+            export VLLM_HOST_IP=$MY_TPU_IP
+
+            if [ "$LWS_WORKER_INDEX" = "0" ]; then
+              echo "Starting Ray Head..."
+              ray start --head --port=6379 --node-ip-address=$MY_TPU_IP --resources='{"TPU": 4}' --block &
+              sleep 15
+              until ray status; do sleep 5; done
+              
+              echo "Starting vLLM API Server with Customer Production Settings..."
+              python3 -m vllm.entrypoints.openai.api_server \
+                --model=/osmosis/merged_model \
+                --tensor-parallel-size=16 \
+                --pipeline-parallel-size=1 \
+                --distributed-executor-backend=ray \
+                --host=0.0.0.0 --port=8000 \
+                --enforce-eager \
+                --max-model-len=131072 \
+                --max-num-seqs=64 \
+                --gpu-memory-utilization=0.93 \
+                --enable-prefix-caching \
+                --enable-chunked-prefill \
+                --trust-remote-code
+            else
+              echo "Starting Ray Worker..."
+              ray start --address=${LEADER_IP}:6379 --node-ip-address=$MY_TPU_IP --resources='{"TPU": 4}' --block
+            fi
+          ports:
+          - containerPort: 8000
+          - containerPort: 6379
+          volumeMounts:
+          - name: osmosis-volume
+            mountPath: /osmosis
+          - name: dshm
+            mountPath: /dev/shm
+          - name: hf-cache
+            mountPath: /hf-cache
+          resources:
+            requests:
+              google.com/tpu: 4
+              memory: "350Gi"
+            limits:
+              google.com/tpu: 4
+              memory: "350Gi"
+            claims:
+            - name: net-resources
+          env:
+          - name: HF_HOME
+            value: /hf-cache
+          - name: VLLM_ENGINE_READY_TIMEOUT_S
+            value: "1200"
+
+        # ---------------------------------------------------------
+        # CONTAINER 2: Benchmarking Client (Runs on Leader Only)
+        # ---------------------------------------------------------
+        - name: native-bench-client
+          image: vllm/vllm-tpu:nightly
+          env:
+          - name: JAX_PLATFORMS
+            value: "cpu"
+          command: ["bash", "-c"]
+          args:
+          - |
+            set -ex
+            if [ "$LWS_WORKER_INDEX" != "0" ]; then
+              echo "I am a worker node. Idling bench client..."
+              sleep infinity
+            fi
+
+            trap 'pkill -f vllm' EXIT
+            
+            echo "Waiting for vLLM server to become ready..."
+            until curl -sf http://localhost:8000/health; do
+              sleep 10
+            done
+            echo "Server is ready."
+
+            echo "Running a single prompt sanity check..."
+            curl -s -X POST http://localhost:8000/v1/chat/completions \
+                -H "Content-Type: application/json" \
+                -d '{
+                  "model": "/osmosis/merged_model",
+                  "messages": [{"role": "user", "content": "Explain why the sky is blue in one sentence."}],
+                  "max_tokens": 50,
+                  "temperature": 0.0
+                }' | python3 -c "import sys, json; print('SANITY CHECK RESPONSE:', json.load(sys.stdin)['choices'][0]['message']['content'])"
+            
+            echo "Starting Apples-to-Apples Production Benchmark (Concurrency=64)..."
+            mkdir -p /workspace/output
+            
+            vllm bench serve \
+                --model /osmosis/merged_model \
+                --tokenizer /osmosis/merged_model \
+                --dataset-name random \
+                --random-input-len 6400 \
+                --random-prefix-len 2600 \
+                --random-output-len 600 \
+                --ignore-eos \
+                --max-concurrency 64 \
+                --num-prompts 640 \
+                --metric-percentiles 50,90,95,99 \
+                --percentile-metrics ttft,tpot,itl,e2el \
+                --save-result \
+                --result-dir /workspace/output \
+                --result-filename production_c64_results.json \
+                --base-url http://localhost:8000
+            
+            echo "Native benchmarks completed. Installing google-cloud-storage..."
+            pip install google-cloud-storage
+            
+            echo "Uploading production benchmark results to GCS..."
+            python3 -c '
+            import os
+            from google.cloud import storage
+            def upload_dir(bucket_name, local_dir, gcs_prefix):
+                client = storage.Client()
+                bucket = client.bucket(bucket_name)
+                for root, dirs, files in os.walk(local_dir):
+                    for file in files:
+                        local_path = os.path.join(root, file)
+                        rel_path = os.path.relpath(local_path, local_dir)
+                        blob_path = os.path.join(gcs_prefix, rel_path)
+                        blob = bucket.blob(blob_path)
+                        blob.upload_from_filename(local_path)
+                        print(f"Uploaded {local_path} to gs://{bucket_name}/{blob_path}")
+            
+            upload_dir("ank-qwen-serving-314837540096", "/workspace/output", "qwen36-35b-benchmarks/v6e/tp16_production_target")
+            '
+            echo "All results uploaded successfully. Shutting down co-located vLLM server process..."
+            pkill -f vllm
+            echo "Cleanup complete."
+          volumeMounts:
+          - name: output-volume
+            mountPath: /workspace/output
+          - name: osmosis-volume
+            mountPath: /osmosis
+
+        resourceClaims:
+        - name: net-resources
+          resourceClaimTemplateName: all-netdev
+        volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+        - name: osmosis-volume
+          emptyDir:
+            medium: Memory
+        - name: hf-cache
+          emptyDir:
+            medium: Memory
+        - name: output-volume
+          emptyDir: {}
+
