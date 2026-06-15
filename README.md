@@ -22,23 +22,23 @@ Before deploying the serving components, the fundamental GKE and VPC environment
 
 1.  **Configure Custom Networking**
     High-throughput TPU multi-host communication requires dedicated network setups to prevent inter-node bottlenecks. Set up the network stack by following:
-    👉 `create_custom_networking.md`
+    `create_custom_networking.md`
 2.  **Spin Up Infrastructure & GKE Cluster**
-    Establish your core GKE cluster control plane and base environment details by following:
-    👉 `setup_infra.md`
+    Deploy the core GKE cluster pinned to your custom VPC/subnetwork, retrieve credentials, inject your Hugging Face secret, and install the LeaderWorkerSet (LWS) operator via Helm. This file also provisions GCS Rapid Cache in the TPU zone and configures secure Google Cloud Workload Identity bindings for storage access control. Follow the setup via:
+    `setup_infra.md`
 3.  **Provision TPU Node Pools**
     Depending on whether you are targeting the single-host (`v6e-8`) or multi-host (`v6e-16`) deployment architecture, create the specialized TPU node pools by executing the configurations within:
-    👉 `provision_tpu.md`
+    `provision_tpu.md`
 
 ### Phase 2: Model Acquisition & LoRA Merging
 To guarantee low latency and avoid the execution overhead of fetching dynamic adapters during runtime, we pre-merge the LoRA weights directly into the base model's weight matrices.
 
 1.  **Download Base Model Weights**
     Pull the native Qwen 3.6 35B model files down from Hugging Face directly into a designated Google Cloud Storage (GCS) bucket. *Note: A valid Hugging Face (`HF_TOKEN`) authorized for the repository access is required.* Follow the instructions in:
-    👉 `download_base_model.md`
+    `download_base_model.md`
 2.  **Execute the LoRA Weight Merge**
     Run the offline merging script to blend the base model weights stored in your GCS bucket with your target LoRA adapter. The unified output is stored back into the bucket, mounted inside GKE pods seamlessly using **GCS FUSE**. Follow the steps in:
-    👉 `merge_adapter.md`
+    `merge_adapter.md`
 
 ### Phase 3: GKE Service Deployment
 Once the merged weights are ready in your bucket, apply the Kubernetes serving manifest matching your target tensor-parallelism (TP) and data-parallelism (DP) layout:
